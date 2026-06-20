@@ -39,18 +39,21 @@ for b in range(B):
 head_size =16
 key=nn.Linear(C,head_size,bias=False)
 query=nn.Linear(C,head_size,bias=False)
+value=nn.Linear(C,head_size,bias=False)
 k=key(x)
 q=query(x)
+v=value(x) # v is used for x's multiple splits, in the feature dimention
 
 wei=q@k.transpose(-2,-1) #(B,T,16) @ (B,16,T) => (B,T,T)
-print(f"wei table ={wei[:1,:,:]}")
+# print(f"wei table ={wei[:1,:,:]}")
 
 tril=torch.tril(torch.ones(T,T))
 wei=wei.masked_fill(tril==0,float('-inf'))
-print(f"wei inf ={wei[:1,:,:]}")
+# print(f"wei inf ={wei[:1,:,:]}")
 
 wei=F.softmax(wei,dim=-1)
-print(f"wei softmax ={wei[:1,:,:]}")
+# print(f"wei softmax ={wei[:1,:,:]}")
 
-out=wei@x
-# print(out)
+out=wei@v
+#out2=wei@x
+#print(out)
