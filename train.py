@@ -4,14 +4,16 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 device='cuda' if torch.cuda.is_available() else 'cpu'
-batch_size=32
-block_size=8
+batch_size=64
+block_size=256
 max_iters=4000
 eval_interval=500
 eval_batches=200
-learning_rate=1e-3
-n_emb=32
-n_heads=4
+learning_rate=3e-4
+n_emb=384 #n_heads * 64
+n_heads=6
+n_layer=6
+dropout=0.2
 torch.manual_seed(42)
 
 with open('input.txt','r',encoding='utf-8') as f:
@@ -61,6 +63,7 @@ class Head(nn.Module):
         self.query=nn.Linear(n_emb,head_size,bias=False)
         self.value=nn.Linear(n_emb,head_size,bias=False)
         self.register_buffer('tril',torch.tril(torch.ones(block_size,block_size)))# 1.efficiency, this is a tempplate 2.compatibilty, ensure tril mask is in the gpu 
+        self.dropout=nn.Dropout(dropout)
     def forward(self,x):
         B,T,C=x.shape
         q=self.query(x) #(B,T,C)=>(B,T,head_size)
@@ -70,6 +73,7 @@ class Head(nn.Module):
         wei=q@k.transpose(-2,-1) *C**-0.5 #(B,T,head_size)*(B,head_size,T)=>(B,T,T) # *C**-0.5 to ensure the sigma == 1
         wei=wei.masked_fill(self.tril[:T,:T]==0,float('-inf'))
         wei=F.softmax(wei,dim=-1) #obtain the probability distribution
+        wei=self.dropout(wei)
         # perform the weighted aggragation of the values
         out=wei@v#(B,T,T)@(B,T,head_size)=>(B,T,head_size)
         return out
@@ -79,9 +83,10 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         self.heads=nn.ModuleList([Head(head_size) for _ in range(n_heads)])
         self.proj=nn.Linear(n_emb,n_emb) # mix the features
+        self.dropout=nn.Dropout(dropout)
     def forward(self,x):
         out=torch.cat([h(x) for h in self.heads],dim=-1)
-        out=self.proj(out)
+        out=self.dropout(self.proj(out))
         return out
 
 class FeedFoward(nn.Module):
@@ -100,9 +105,11 @@ class Block(nn.Module):
         super().__init__()
         self.sa=MultiHeadAttention(n_heads,n_emb//n_heads)
         self.ffwd=FeedFoward(n_emb)
+        self.ln1=nn.LayerNorm(n_emb)
+        self.ln2=nn.LayerNorm(n_emb)
     def forward(self,x):
-        x=x+self.sa(x)
-        x=x+self.ffwd(x)
+        x=x+self.sa(self.ln1(x))
+        x=x+self.ffwd(self.ln2(x)) # pre-LN, more stable than post-LN in the attention paper
         return x
 
 class BigramLanguageModel(nn.Module):
@@ -111,11 +118,8 @@ class BigramLanguageModel(nn.Module):
         super().__init__()
         self.token_embedding_table=nn.Embedding(vocab_size,n_emb)
         self.position_embedding_table=nn.Embedding(block_size,n_emb)
-        self.blocks=nn.Sequential(
-            Block(n_emb,n_heads),# n_heads=4
-            Block(n_emb,n_heads),
-            Block(n_emb,n_heads)
-        )
+        self.blocks=nn.Sequential(*[Block(n_emb,n_heads) for _ in range(n_layer)]) # * is unpacking operator, so Sequential() expects nn.Module rather than a list
+        self.ln_f=nn.LayerNorm(n_emb)
         # self.sa_head=MultiHeadAttention(n_heads,n_emb//n_heads)#exp 4 heads of 8 dim self-attention
         # self.ffwd=FeedFoward(n_emb)# linear => unlinear
         self.lm_head=nn.Linear(n_emb,vocab_size)
@@ -131,6 +135,7 @@ class BigramLanguageModel(nn.Module):
         #x=self.sa_head(x)
         #x=self.ffwd(x)#(B,T,C)
         x=self.blocks(x) #(B,T,C)
+        x=self.ln_f(x)
         logits=self.lm_head(x)# logits [B,T,vocab_size]
 
         #loss
@@ -162,7 +167,10 @@ model=model.to(device)
 # optimizer
 optimizer=torch.optim.AdamW(model.parameters(),lr=learning_rate)
 
-for iter in range(max_iters):
+import time
+start_time = time.time()
+
+for iter in range(max_iters+1):
     if iter % eval_interval == 0:
         losses=eval_loss()
         print(f"setp {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
@@ -174,6 +182,20 @@ for iter in range(max_iters):
     loss.backward()
     optimizer.step()
 
+    if device == 'cuda':
+        torch.cuda.synchronize()
+    if iter % eval_interval == 0 and iter >0:
+        elapsed = time.time() - start_time
+        time_per_iter = elapsed / iter
+        eta = (max_iters - iter) * time_per_iter
+
+        print(f"iter {iter}/{max_iters} | loss {loss.item():.4f} | 剩余 {eta/60:.1f} min")
+
+#parameters num
+total_params = sum(p.numel() for p in model.parameters())
+print(f"total_params is {total_params}")
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"trainable_params is {trainable_params}")
 # generate 
 context=torch.zeros((1,1),dtype=torch.long,device=device)
 print(decoder(model.generate(context,max_new_tokens=500)[0].tolist()))
