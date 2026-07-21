@@ -8,11 +8,11 @@ import math
 class CausalSelfAttention(nn.Module):
     def __init__(self,config):
         super().__init__()
-        assert config.n_emb % config.n_head == 0
-        self.c_attn=nn.Linear(config.n_emb,3*config.n_emb)
-        self.c_proj=nn.Linear(config.n_emb,config.n_emb)
+        assert config.n_embd % config.n_head == 0
+        self.c_attn=nn.Linear(config.n_embd,3*config.n_embd)
+        self.c_proj=nn.Linear(config.n_embd,config.n_embd)
         self.n_head=config.n_head
-        self.n_emb =config.n_emb
+        self.n_embd =config.n_embd
         self.register_buffer(
             "bias",
             torch.tril(torch.ones(config.block_size,config.block_size))
@@ -21,9 +21,9 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self,x):
         B,T,C=x.size() 
-        #in GPT-2 (124M), n_head=12, head_size=64, n_emb==nh*hs=768
+        #in GPT-2 (124M), n_head=12, head_size=64, n_embd==nh*hs=768
         qkv=self.c_attn(x) # x @ W.T + b
-        q,k,v=qkv.split(self.n_emb,dim=2) # (B,T,3C)=>3(B,T,C)
+        q,k,v=qkv.split(self.n_embd,dim=2) # (B,T,3C)=>3(B,T,C)
         # multihead
         k=k.view(B,T,self.n_head,C//self.n_head).transpose(1,2) # (B,T,768)=>(B,12,T,64)==(B,nd,T,hs)
         q=q.view(B,T,self.n_head,C//self.n_head).transpose(1,2)
@@ -46,18 +46,18 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module): # FFN
     def __init__(self,config):
         super().__init__()
-        self.c_fc  =nn.Linear(config.n_emb,4* config.n_emb) #fully connected
+        self.c_fc  =nn.Linear(config.n_embd,4* config.n_embd) #fully connected
         self.gelu  =nn.GELU(approximate='tanh')
-        self.c_proj=nn.Linear(4* config.n_emb,config.n_emb)
+        self.c_proj=nn.Linear(4* config.n_embd,config.n_embd)
     def forward(self,x):
         return self.c_proj(self.gelu(self.c_fc(x)))
 
 class Block(nn.Module):
     def __init__(self,config):
         super().__init__()
-        self.ln_1=nn.LayerNorm(config.n_emb) # weights, bias, 2*n_emb
+        self.ln_1=nn.LayerNorm(config.n_embd) # weights, bias, 2*n_embd
         self.attn=CausalSelfAttention(config)
-        self.ln_2=nn.LayerNorm(config.n_emb)
+        self.ln_2=nn.LayerNorm(config.n_embd)
         self.mlp=MLP(config)
     def forward(self,x):
         x=x+self.attn(self.ln_1(x))
@@ -70,30 +70,30 @@ class GPTConfig:
     vocab_size:int=50257# 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
     n_layer:int=12
     n_head:int=12
-    n_emb:int=768
+    n_embd:int=768
 
 class GPT(nn.Module):
     def __init__(self,config):
         super().__init__()
         self.config=config
         self.transformer=nn.ModuleDict(dict(
-            wte=nn.Embedding(config.vocab_size,config.n_emb),
-            wpe=nn.Embedding(config.block_size,config.n_emb),
+            wte=nn.Embedding(config.vocab_size,config.n_embd),
+            wpe=nn.Embedding(config.block_size,config.n_embd),
             h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),#12
-            ln_f=nn.LayerNorm(config.n_emb),
+            ln_f=nn.LayerNorm(config.n_embd),
         ))
-        self.lm_head=nn.Linear(config.n_emb,config.vocab_size,bias=False)
+        self.lm_head=nn.Linear(config.n_embd,config.vocab_size,bias=False)
 
-    def forward(self,idx):
+    def forward(self,idx,targets=None):
         #idx.shape==(B,T)
         B,T=idx.size()
         assert T<=self.config.block_size, f"Cannot forward sequence of length {T}, block size is {self.config.block_size}."
         
         # forward token and pos emb
         pos=torch.arange(0,T,dtype=torch.long,device=idx.device) # shape (T,)
-        pos_emb=self.transformer.wpe(pos) # (T,)  =>   (T,n_emb)
-        tok_emb=self.transformer.wte(idx) # (B,T) => (B,T,n_emb)
-        x=pos_emb+tok_emb #(T,n_emb)+(B,T,n_emb) => broadcast (B,T,n_emb)+(B,T,n_emb)
+        pos_emb=self.transformer.wpe(pos) # (T,)  =>   (T,n_embd)
+        tok_emb=self.transformer.wte(idx) # (B,T) => (B,T,n_embd)
+        x=pos_emb+tok_emb #(T,n_embd)+(B,T,n_embd) => broadcast (B,T,n_embd)+(B,T,n_embd)
         
         # forward blocks of the transformer
         for block in self.transformer.h:
@@ -102,7 +102,10 @@ class GPT(nn.Module):
         #forward ln_f and the classfier
         x=self.transformer.ln_f(x)
         logits=self.lm_head(x)
-        return logits
+        loss=None
+        if targets is not None:
+            loss=F.cross_entropy(logits.view(-1,logits.size(-1)),targets.view(-1)) # softmax + -log p
+        return logits,loss
  
     @classmethod
     def from_pretrained(cls,model_type):
@@ -111,10 +114,10 @@ class GPT(nn.Module):
         print("loading weights from pretrained gpt: %s" % model_type)
 
         config_args={
-            'gpt2':        dict(n_layer=12,n_head=12,n_emb=768),#124M
-            'gpt2-medium': dict(n_layer=24,n_head=16,n_emb=1024),#350M
-            'gpt2-large':  dict(n_layer=36,n_head=20,n_emb=1280),#774M
-            'gpt2-xl':     dict(n_layer=48,n_head=25,n_emb=1600),#1550M
+            'gpt2':        dict(n_layer=12,n_head=12,n_embd=768),#124M
+            'gpt2-medium': dict(n_layer=24,n_head=16,n_embd=1024),#350M
+            'gpt2-large':  dict(n_layer=36,n_head=20,n_embd=1280),#774M
+            'gpt2-xl':     dict(n_layer=48,n_head=25,n_embd=1600),#1550M
         }[model_type]
         config_args['vocab_size']=50257
         config_args['block_size']=1024
@@ -159,23 +162,66 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         return model
 
+# ---------------------------------------
+# prefix tokens
+import tiktoken
+class DataLoderLite:
+    def __init__(self,B,T):
+        self.B=B
+        self.T=T
+
+        with open('/home/soren/project/GPT/dataset/input.txt','r') as f:
+            text=f.read()
+        enc=tiktoken.get_encoding('gpt2')
+        tokens=enc.encode(text)
+        self.tokens=torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B*T)} batches") # how many batches are needed to train one epoch
+
+        self.current_position=0
+    
+    def next_batch(self):
+        B,T=self.B,self.T
+        buf=self.tokens[self.current_position:self.current_position + B*T + 1]
+        x=buf[:-1].view(B,T)
+        y=buf[1:].view(B,T)
+        self.current_position += B*T
+        # if out of bounds, reset
+        if self.current_position + (B*T+1) > len(self.tokens):
+            self.current_position=0
+        return x,y
+    
 # ---------------------------
 num_return_sequence=5
 max_length=30
-
-model=GPT.from_pretrained('gpt2')
-model.eval()
-model.to('cuda')
-
-# prefix tokens
-import tiktoken
-enc=tiktoken.get_encoding('gpt2')
-tokens=enc.encode("Hello, I'm a language model,")
-tokens=torch.tensor(tokens,dtype=torch.long) #(8,)
-tokens=tokens.unsqueeze(0).repeat(num_return_sequence,1) #(5,8)
-x=tokens.to('cuda')
-
 torch.manual_seed(37)
 torch.cuda.manual_seed(37)
-while x.size(1)<max_length:
-    logits
+
+# device select
+device='cpu'
+if torch.cuda.is_available():
+    device='cuda'
+elif hasattr(torch.backends,'mps') and torch.backends.mps.is_available():
+    device='mps'
+print(f"using device: {device}")
+
+# get tokens
+train_loader=DataLoderLite(B=4,T=32)
+
+# get logits
+model=GPT(GPTConfig())
+model.to(device)
+
+# optimize grad
+optimizer=torch.optim.AdamW(model.parameters(),lr=3e-4)
+for i in range(50):
+    x,y=train_loader.next_batch()
+    x,y=x.to(device),y.to(device)
+    optimizer.zero_grad()
+    logits,loss=model(x,y)
+    loss.backward() # calculate grad
+    optimizer.step() # update grad
+    print(f"batch {i}, loss: {loss.item()}")
+
+
+import sys; sys.exit(0)
