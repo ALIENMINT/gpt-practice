@@ -11,6 +11,7 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
         self.c_attn=nn.Linear(config.n_embd,3*config.n_embd)
         self.c_proj=nn.Linear(config.n_embd,config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT=1 # type: ignore
         self.n_head=config.n_head
         self.n_embd =config.n_embd
         self.register_buffer(
@@ -31,11 +32,11 @@ class CausalSelfAttention(nn.Module):
         # attention
         att=((q @ k.transpose(-2,-1)) #(B,12,T,64)*(B,12,64,T)=>(B,12,T,T)
              * (1.0 / math.sqrt(k.size(-1)))) # scale down, prevent var from overlarge, *(1.0/sqrt(64))
-        att=att.masked_fill(self.bias[:,:,T,T]==0,float('-inf'))
+        att=att.masked_fill(self.bias[:,:,:T,:T]==0,float('-inf'))
         att=F.softmax(att,dim=-1)
         y=att @ v                                  #(B,12,T,T)*(B,12,T,64)=>(B,12,T,64)
         y=y.transpose(1,2).contiguous().view(B,T,C)#(B,12,T,64)=>(B,T,12,64)=>(B,T,C)
-        y=self.c_proj(y)                           #(B,T,C)=>(B,T,C), to mix the independent k,q,v
+        y=self.c_proj(y)                           #(B,T,C)=>(B,T,C), mix k,q,v to get single head attn
         return y
         # query: what info in other pos should I pay attention to in this pos?
         # key: index, tell other pos what key words they can find in this pos.
@@ -49,6 +50,7 @@ class MLP(nn.Module): # FFN
         self.c_fc  =nn.Linear(config.n_embd,4* config.n_embd) #fully connected
         self.gelu  =nn.GELU(approximate='tanh')
         self.c_proj=nn.Linear(4* config.n_embd,config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT=1 # type: ignore
     def forward(self,x):
         return self.c_proj(self.gelu(self.c_fc(x)))
 
@@ -83,6 +85,24 @@ class GPT(nn.Module):
             ln_f=nn.LayerNorm(config.n_embd),
         ))
         self.lm_head=nn.Linear(config.n_embd,config.vocab_size,bias=False)
+
+        # weight sharing scheme
+        # 768*50257=28,597,376, about 30% of 124M, huge usage decline!
+        self.transformer.wte.weight=self.lm_head.weight # data_ptr() points the same address
+
+        # init params
+        self.apply(self._init_weight)
+
+    def _init_weight(self,module):
+        if isinstance(module,nn.Linear):
+            std=0.02
+            if hasattr(module,'NANOGPT_SCALE_INIT'):
+                std*=(2*self.config.n_layer)**-0.5 # n**-0.5
+            torch.nn.init.normal_(module.weight,mean=0.0,std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module,nn.Embedding):
+            torch.nn.init.normal_(module.weight,mean=0.0,std=0.02)
 
     def forward(self,idx,targets=None):
         #idx.shape==(B,T)
@@ -206,22 +226,27 @@ elif hasattr(torch.backends,'mps') and torch.backends.mps.is_available():
 print(f"using device: {device}")
 
 # get tokens
-train_loader=DataLoderLite(B=4,T=32)
+train_loader=DataLoderLite(B=1,T=1024)
 
 # get logits
 model=GPT(GPTConfig())
 model.to(device)
 
+import time
 # optimize grad
 optimizer=torch.optim.AdamW(model.parameters(),lr=3e-4)
 for i in range(50):
+    t0=time.time()
     x,y=train_loader.next_batch()
     x,y=x.to(device),y.to(device)
     optimizer.zero_grad()
     logits,loss=model(x,y)
     loss.backward() # calculate grad
     optimizer.step() # update grad
-    print(f"batch {i}, loss: {loss.item()}")
+    torch.cuda.synchronize()
+    t1=time.time()
+    dt=(t1-t0)*1000
+    print(f"batch {i}, loss: {loss.item()}, dt: {dt}ms")
 
 
 import sys; sys.exit(0)
